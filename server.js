@@ -47,7 +47,13 @@ function getBin(name) {
 function fetchTitle(url, signal) {
   return new Promise((resolve) => {
     // 1. Ensure getBin('yt-dlp') returns just 'yt-dlp'
-    const proc = spawn(getBin('yt-dlp'), ['--get-title', '--no-playlist', url]);
+    // Add '--user-agent' to mimic a standard Chrome browser
+    const proc = spawn(getBin('yt-dlp'), [
+      '--get-title',
+      '--no-playlist',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      url
+    ]);
     let title = '';
     let errorOutput = ''; // Added to store errors
 
