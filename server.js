@@ -43,19 +43,30 @@ function getBin(name) {
   return name;
 }
 
+// ── Common extra args to bypass YouTube bot detection ──────────────────────
+// Uses Android player client (avoids most "Sign in to confirm you're not a bot" errors).
+// If a cookies.txt secret file is present (e.g. Render Secret Files), use it too.
+const COOKIES_PATH = '/etc/secrets/cookies.txt';
+function getAntiBotArgs() {
+  const args = ['--extractor-args', 'youtube:player_client=android'];
+  if (fs.existsSync(COOKIES_PATH)) {
+    args.push('--cookies', COOKIES_PATH);
+  }
+  return args;
+}
+
 // ── Helper: fetch title using yt-dlp ──────────────────────────────────────
 function fetchTitle(url, signal) {
   return new Promise((resolve) => {
-    // 1. Ensure getBin('yt-dlp') returns just 'yt-dlp'
-    // Add '--user-agent' to mimic a standard Chrome browser
     const proc = spawn(getBin('yt-dlp'), [
       '--get-title',
       '--no-playlist',
+      ...getAntiBotArgs(),
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       url
     ]);
     let title = '';
-    let errorOutput = ''; // Added to store errors
+    let errorOutput = '';
 
     const timer = setTimeout(() => {
       proc.kill();
@@ -72,7 +83,6 @@ function fetchTitle(url, signal) {
 
     proc.stdout.on('data', d => (title += d.toString()));
 
-    // 2. Capture stderr instead of ignoring it
     proc.stderr.on('data', (d) => {
       errorOutput += d.toString();
     });
@@ -80,7 +90,6 @@ function fetchTitle(url, signal) {
     proc.on('close', code => {
       clearTimeout(timer);
       if (code !== 0) {
-        // 3. Log the error to the Render dashboard so we can see it
         console.error('yt-dlp failed:', errorOutput);
         resolve(null);
       } else {
@@ -168,6 +177,7 @@ app.get('/start', rateLimit, async (req, res) => {
       '-x', '--audio-format', 'mp3', '--audio-quality', '0',
       '--ffmpeg-location', getBin('ffmpeg'),
       '--no-playlist', '--newline',
+      ...getAntiBotArgs(),
       '-o', outputPath, url
     ];
   } else {
@@ -176,6 +186,7 @@ app.get('/start', rateLimit, async (req, res) => {
       '--merge-output-format', 'mp4',
       '--ffmpeg-location', getBin('ffmpeg'),
       '--no-playlist', '--newline',
+      ...getAntiBotArgs(),
       '-o', outputPath, url
     ];
   }
