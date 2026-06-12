@@ -3,8 +3,12 @@ aptPkgs = ["ffmpeg", "python3", "ca-certificates", "curl"]
 
 [phases.build]
 cmds = [
-  "echo 'Build phase complete — yt-dlp will be downloaded at start'"
+  "echo '[build] Downloading yt-dlp binary...'",
+  "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp",
+  "chmod a+rx ./yt-dlp",
+  "echo '[build] yt-dlp version:' && ./yt-dlp --version",
+  "echo '[build] Binary location:' && ls -lah ./yt-dlp"
 ]
 
 [start]
-cmd = "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /app/yt-dlp && chmod a+rx /app/yt-dlp && echo '[nixpacks start] yt-dlp installed:' && /app/yt-dlp --version && node server.js"
+cmd = "echo '[start] cwd:' && pwd && echo '[start] yt-dlp check:' && ls -lah ./yt-dlp && node server.js"

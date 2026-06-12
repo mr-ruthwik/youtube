@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const app = express();
@@ -8,40 +8,35 @@ const app = express();
 app.use(express.static('public'));
 
 // ── Binary resolution ──────────────────────────────────────────────────────
-// Render nixpacks: build phase puts the binary in the BUILD container,
-// not the runtime container. So we download yt-dlp at startup via the
-// nixpacks [start] phase (see nixpacks.toml). The binary lands at /app/yt-dlp.
-// We probe a priority list of paths and cache the winner.
-
+// Priority: process.cwd()/yt-dlp (installed by build script) → /app/yt-dlp → PATH
 const YTDLP_CANDIDATES = [
-  '/app/yt-dlp',                          // Render: downloaded by start cmd
-  path.join(__dirname, 'yt-dlp'),         // local relative (same as above in prod)
-  '/usr/local/bin/yt-dlp',               // some environments
-  '/usr/bin/yt-dlp',                      // apt-installed
+  path.join(process.cwd(), 'yt-dlp'),     // Render: build script puts it here
+  path.join(__dirname, 'yt-dlp'),         // same dir as server.js
+  '/app/yt-dlp',                          // fallback absolute
+  '/usr/local/bin/yt-dlp',
+  '/usr/bin/yt-dlp',
 ];
 
 let _ytdlpBin = null;
 function getYtDlpBin() {
   if (_ytdlpBin) return _ytdlpBin;
-
   for (const candidate of YTDLP_CANDIDATES) {
-    if (fs.existsSync(candidate)) {
-      _ytdlpBin = candidate;
-      console.log(`[startup] yt-dlp found at: ${candidate}`);
-      return candidate;
-    }
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).size > 0) {
+        _ytdlpBin = candidate;
+        console.log(`[startup] yt-dlp found at: ${candidate}`);
+        return candidate;
+      }
+    } catch (_) {}
   }
-
-  // Last resort: hope it's on PATH (local dev on Windows/Mac)
-  console.warn('[startup] yt-dlp binary not found in known paths — falling back to PATH');
+  console.warn('[startup] yt-dlp not found in known paths — using PATH');
   _ytdlpBin = 'yt-dlp';
   return _ytdlpBin;
 }
 
-// Log binary status at startup
+console.log('[startup] cwd =', process.cwd());
 console.log('[startup] __dirname =', __dirname);
-console.log('[startup] Checking for yt-dlp binary...');
-getYtDlpBin(); // resolve + log at boot
+getYtDlpBin();
 
 // ── Rate limiting ──────────────────────────────────────────────────────────
 const rateLimitMap = new Map();
@@ -69,133 +64,195 @@ function isValidYouTubeUrl(url) {
   } catch { return false; }
 }
 
-// ── Sanitize filename ──────────────────────────────────────────────────────
 function safeFilename(title) {
   return (title || 'download').replace(/[^a-z0-9_\-\s]/gi, '').trim().slice(0, 80) || 'download';
 }
 
-// ── Common extra args to bypass YouTube bot detection ──────────────────────
+// ── Cookie / secret paths ──────────────────────────────────────────────────
 const COOKIES_PATH = '/etc/secrets/cookies.txt';
-const PLAYER_CLIENTS = ['ios', 'android', 'mweb', 'web'];
+const PO_TOKEN_PATH = '/etc/secrets/po_token.txt';
 
-function getAntiBotArgs(client) {
-  const args = ['--extractor-args', `youtube:player_client=${client}`];
+function getCookieArgs() {
+  const args = [];
   if (fs.existsSync(COOKIES_PATH)) {
     args.push('--cookies', COOKIES_PATH);
+    console.log('[bot] Using cookies file');
   }
   return args;
 }
 
-// ── Helper: fetch title using yt-dlp, trying multiple player clients ──────
-function fetchTitleWithClient(url, client, signal) {
+function getPoTokenArgs() {
+  const args = [];
+  if (fs.existsSync(PO_TOKEN_PATH)) {
+    try {
+      const token = fs.readFileSync(PO_TOKEN_PATH, 'utf8').trim();
+      if (token) {
+        args.push('--extractor-args', `youtube:po_token=web+${token}`);
+        console.log('[bot] Using PO token');
+      }
+    } catch (_) {}
+  }
+  return args;
+}
+
+// ── Advanced strategy matrix for bypassing bot detection ──────────────────
+// Each strategy is tried in order. Different combos hit different YouTube endpoints.
+// tv_embedded and mediaconnect are less monitored server-side clients.
+const STRATEGIES = [
+  {
+    name: 'tv_embedded',
+    extractorArgs: 'youtube:player_client=tv_embedded',
+    extraArgs: ['--no-check-certificates'],
+  },
+  {
+    name: 'ios+cookies',
+    extractorArgs: 'youtube:player_client=ios',
+    extraArgs: ['--no-check-certificates', '--sleep-requests', '1'],
+  },
+  {
+    name: 'android_vr',
+    extractorArgs: 'youtube:player_client=android_vr',
+    extraArgs: ['--no-check-certificates'],
+  },
+  {
+    name: 'web_creator',
+    extractorArgs: 'youtube:player_client=web_creator',
+    extraArgs: ['--no-check-certificates', '--sleep-requests', '1'],
+  },
+  {
+    name: 'android',
+    extractorArgs: 'youtube:player_client=android',
+    extraArgs: ['--no-check-certificates', '--sleep-requests', '2'],
+  },
+  {
+    name: 'mweb',
+    extractorArgs: 'youtube:player_client=mweb',
+    extraArgs: ['--no-check-certificates'],
+  },
+];
+
+// Rotate user agents to avoid fingerprinting
+const USER_AGENTS = [
+  'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+];
+
+function getBaseArgs(strategy) {
+  const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  return [
+    '--extractor-args', strategy.extractorArgs,
+    '--user-agent', ua,
+    '--no-warnings',
+    ...strategy.extraArgs,
+    ...getCookieArgs(),
+    ...getPoTokenArgs(),
+  ];
+}
+
+// ── Fetch title + verify URL is accessible using --print ──────────────────
+// Using --print title is faster and more reliable than --get-title.
+// We also pass --skip-download so we know the video IS accessible before downloading.
+function fetchTitleWithStrategy(url, strategy, signal) {
   return new Promise((resolve) => {
     const bin = getYtDlpBin();
-    console.log(`[fetchTitle] using binary: ${bin}, client: ${client}`);
+    console.log(`[fetchTitle] strategy=${strategy.name}`);
 
-    const proc = spawn(bin, [
-      '--get-title',
+    const args = [
+      '--print', 'title',
       '--no-playlist',
-      ...getAntiBotArgs(client),
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--skip-download',
+      ...getBaseArgs(strategy),
       url
-    ]);
-    let title = '';
-    let errorOutput = '';
+    ];
 
-    const timer = setTimeout(() => {
-      proc.kill();
-      resolve(null);
-    }, 30000);
+    const proc = spawn(bin, args);
+    let output = '';
+    let errOutput = '';
 
-    const onAbort = () => {
-      clearTimeout(timer);
-      proc.kill();
-      resolve(null);
-    };
+    const timer = setTimeout(() => { proc.kill(); resolve(null); }, 25000);
+    const onAbort = () => { clearTimeout(timer); proc.kill(); resolve(null); };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
-    proc.stdout.on('data', d => (title += d.toString()));
-    proc.stderr.on('data', (d) => { errorOutput += d.toString(); });
+    proc.stdout.on('data', d => (output += d.toString()));
+    proc.stderr.on('data', d => (errOutput += d.toString()));
 
     proc.on('close', code => {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
       if (code !== 0) {
-        console.error(`yt-dlp (client=${client}) failed with code ${code}:`, errorOutput.slice(0, 400));
+        console.error(`[fetchTitle] strategy=${strategy.name} exit=${code}: ${errOutput.slice(0, 300)}`);
         resolve(null);
       } else {
-        const t = title.trim();
-        resolve(t ? t : null);
+        const t = output.trim().split('\n')[0]; // first line = title
+        resolve(t || null);
       }
     });
-
-    proc.on('error', (err) => {
+    proc.on('error', err => {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
-      console.error('[fetchTitle] Process error:', err.message, '| binary was:', bin);
+      console.error('[fetchTitle] spawn error:', err.message);
       resolve(null);
     });
   });
 }
 
-// Try each player client in order until one returns a title.
 async function fetchTitle(url, signal) {
-  for (const client of PLAYER_CLIENTS) {
+  for (const strategy of STRATEGIES) {
     if (signal && signal.aborted) return null;
-    const title = await fetchTitleWithClient(url, client, signal);
-    if (title) return title;
+    const title = await fetchTitleWithStrategy(url, strategy, signal);
+    if (title) return { title, strategy };
+    // Small delay between strategy attempts to avoid rapid-fire detection
+    await new Promise(r => setTimeout(r, 500));
   }
   return null;
 }
 
-// ── Helper: run a download attempt with a given player client ─────────────
-function runDownload({ url, format, client, outputPath, send, downloadProcRef, lastPercentRef }) {
+// ── Download with a specific strategy ────────────────────────────────────
+function runDownload({ url, format, strategy, outputPath, send, downloadProcRef, lastPercentRef }) {
   return new Promise((resolve) => {
     const bin = getYtDlpBin();
-    let args;
+    console.log(`[download] strategy=${strategy.name} format=${format}`);
 
+    let args;
     if (format === 'mp3') {
       args = [
         '-x', '--audio-format', 'mp3', '--audio-quality', '0',
         '--ffmpeg-location', 'ffmpeg',
         '--no-playlist', '--newline',
-        ...getAntiBotArgs(client),
-        '-o', outputPath, url
+        ...getBaseArgs(strategy),
+        '-o', outputPath,
+        url
       ];
     } else {
+      // Prefer mp4+m4a. Fallback chain handles cases where those streams aren't available.
       args = [
-        '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '-f', 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best',
         '--merge-output-format', 'mp4',
         '--ffmpeg-location', 'ffmpeg',
         '--no-playlist', '--newline',
-        ...getAntiBotArgs(client),
-        '-o', outputPath, url
+        ...getBaseArgs(strategy),
+        '-o', outputPath,
+        url
       ];
     }
 
     const proc = spawn(bin, args);
     downloadProcRef.proc = proc;
 
-    let sawAnyProgress = false;
-
-    proc.stdout.on('data', (chunk) => {
+    proc.stdout.on('data', chunk => {
       const lines = chunk.toString().split('\n');
       for (const line of lines) {
-        const match = line.match(/(\d+\.?\d*)%/);
-        if (match) {
-          sawAnyProgress = true;
-          const pct = Math.min(Math.round(parseFloat(match[1])), 99);
+        const pctMatch = line.match(/(\d+\.?\d*)%/);
+        if (pctMatch) {
+          const pct = Math.min(Math.round(parseFloat(pctMatch[1])), 99);
           if (pct > lastPercentRef.value) {
             lastPercentRef.value = pct;
-            let stage = 'Downloading...';
-            if (pct >= 95) stage = 'Merging...';
-            else if (pct >= 80) stage = 'Converting...';
-            else if (pct >= 50) stage = 'Downloading...';
-            else stage = 'Buffering...';
+            const stage = pct >= 95 ? 'Merging...' : pct >= 80 ? 'Converting...' : pct >= 50 ? 'Downloading...' : 'Buffering...';
             send({ type: 'progress', percent: pct, stage });
           }
         }
-
         const speedMatch = line.match(/at\s+([\d.]+\s*\w+\/s)/i);
         const etaMatch = line.match(/ETA\s+([\d:]+)/i);
         if (speedMatch || etaMatch) {
@@ -204,30 +261,30 @@ function runDownload({ url, format, client, outputPath, send, downloadProcRef, l
       }
     });
 
-    proc.stderr.on('data', (chunk) => {
+    proc.stderr.on('data', chunk => {
       const line = chunk.toString();
-      const timeMatch = line.match(/time=(\d+:\d+:\d+)/);
-      if (timeMatch && lastPercentRef.value >= 90) {
+      if (line.includes('time=') && lastPercentRef.value >= 90) {
         lastPercentRef.value = Math.min(lastPercentRef.value + 1, 99);
         send({ type: 'progress', percent: lastPercentRef.value, stage: 'Merging...' });
       }
     });
 
-    proc.on('close', (code) => {
+    proc.on('close', code => {
       downloadProcRef.proc = null;
-      const fileOk = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
-      resolve({ success: code === 0 && fileOk, code, fileOk, sawAnyProgress });
+      // yt-dlp sometimes exits 1 but file is good (post-process warnings)
+      const fileOk = fs.existsSync(outputPath) && fs.statSync(outputPath).size > 10000;
+      resolve({ success: fileOk, code, fileOk });
     });
 
-    proc.on('error', (err) => {
+    proc.on('error', err => {
       downloadProcRef.proc = null;
-      console.error('[runDownload] Process error:', err.message, '| binary was:', bin);
-      resolve({ success: false, code: -1, fileOk: false, error: err });
+      console.error('[download] spawn error:', err.message);
+      resolve({ success: false, code: -1, fileOk: false });
     });
   });
 }
 
-// ── /start endpoint — SSE ─────────────────────────────────────────────────
+// ── /start SSE endpoint ───────────────────────────────────────────────────
 app.get('/start', rateLimit, async (req, res) => {
   const { url, format, id } = req.query;
 
@@ -240,14 +297,10 @@ app.get('/start', rateLimit, async (req, res) => {
   res.flushHeaders();
 
   let sseEnded = false;
-  const send = (data) => {
-    if (!sseEnded) {
-      try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) { }
-    }
+  const send = data => {
+    if (!sseEnded) try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) {}
   };
-  const endSSE = () => {
-    if (!sseEnded) { sseEnded = true; res.end(); }
-  };
+  const endSSE = () => { if (!sseEnded) { sseEnded = true; res.end(); } };
 
   const abortCtrl = new AbortController();
   let clientDisconnected = false;
@@ -259,51 +312,66 @@ app.get('/start', rateLimit, async (req, res) => {
     if (downloadProcRef.proc) downloadProcRef.proc.kill();
   });
 
-  // STEP 1: Fetch title
-  send({ type: 'status', stage: 'Fetching title...' });
+  // STEP 1: Fetch title — also discovers which strategy works for this video/IP combo
+  send({ type: 'status', stage: 'Connecting to YouTube...' });
 
-  const videoTitle = await fetchTitle(url, abortCtrl.signal);
+  const titleResult = await fetchTitle(url, abortCtrl.signal);
 
   if (clientDisconnected) { endSSE(); return; }
 
-  if (!videoTitle) {
-    send({ type: 'title_error', message: 'Could not fetch title. Video may be private, age-restricted, or unavailable.' });
+  if (!titleResult) {
+    send({
+      type: 'title_error',
+      message: 'YouTube is blocking this server\'s IP. Try adding cookies (see README) or wait a few minutes.'
+    });
     endSSE();
     return;
   }
 
-  send({ type: 'title', title: videoTitle });
-  await new Promise(r => setTimeout(r, 300));
+  const { title: videoTitle, strategy: workingStrategy } = titleResult;
+  console.log(`[flow] Title="${videoTitle}" via strategy=${workingStrategy.name}`);
 
+  send({ type: 'title', title: videoTitle });
+  await new Promise(r => setTimeout(r, 200));
   if (clientDisconnected) { endSSE(); return; }
 
-  // STEP 2: Download
+  // STEP 2: Download — start with the strategy that worked for title, then try others
   const ext = format === 'mp3' ? 'mp3' : 'mp4';
   const safeId = String(id).replace(/[^a-z0-9]/gi, '').slice(0, 30) || Date.now().toString();
-  const outputPath = path.join(__dirname, `temp_${format}_${safeId}.${ext}`);
+  const outputPath = path.join(process.cwd(), `temp_${format}_${safeId}.${ext}`);
 
   if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-
   send({ type: 'progress', percent: 2, stage: 'Starting download...' });
+
+  // Reorder strategies: put the working one first
+  const orderedStrategies = [
+    workingStrategy,
+    ...STRATEGIES.filter(s => s.name !== workingStrategy.name)
+  ];
 
   const lastPercentRef = { value: 2 };
   let result = null;
 
-  for (let i = 0; i < PLAYER_CLIENTS.length; i++) {
-    const client = PLAYER_CLIENTS[i];
+  for (let i = 0; i < orderedStrategies.length; i++) {
+    const strategy = orderedStrategies[i];
     if (clientDisconnected) break;
 
     if (i > 0) {
-      send({ type: 'status', stage: `Retrying with a different method (${i + 1}/${PLAYER_CLIENTS.length})...` });
+      send({ type: 'status', stage: `Trying method ${i + 1}/${orderedStrategies.length}...` });
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      await new Promise(r => setTimeout(r, 800)); // brief pause between attempts
     }
 
     result = await runDownload({
-      url, format, client, outputPath, send,
+      url, format, strategy, outputPath, send,
       downloadProcRef, lastPercentRef
     });
 
-    if (result.success) break;
+    if (result.success) {
+      console.log(`[flow] Download succeeded with strategy=${strategy.name}`);
+      break;
+    }
+    console.warn(`[flow] Download failed with strategy=${strategy.name}`);
   }
 
   if (clientDisconnected) {
@@ -312,7 +380,7 @@ app.get('/start', rateLimit, async (req, res) => {
   }
 
   if (!result || !result.success) {
-    send({ type: 'error', message: 'Download failed. Video may be age-restricted, region-locked, or unavailable.' });
+    send({ type: 'error', message: 'Download failed after all methods. Video may be age-restricted, DRM-protected, or region-locked.' });
     endSSE();
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     return;
@@ -327,17 +395,18 @@ app.get('/start', rateLimit, async (req, res) => {
     const fname = safeFilename(videoTitle) + '.' + ext;
     send({ type: 'file', base64, mimeType, filename: fname });
   } catch (e) {
+    console.error('[flow] Failed to read output file:', e.message);
     send({ type: 'error', message: 'Failed to read output file.' });
   } finally {
-    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    if (fs.existsSync(outputPath)) try { fs.unlinkSync(outputPath); } catch (_) {}
     endSSE();
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`[server] Running on port ${PORT}`);
 });
 
-process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); });
-process.on('unhandledRejection', (reason) => { console.error('Unhandled rejection:', reason); });
+process.on('uncaughtException', err => console.error('[uncaught]', err));
+process.on('unhandledRejection', reason => console.error('[unhandled]', reason));
