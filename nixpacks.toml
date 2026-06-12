@@ -3,8 +3,8 @@ aptPkgs = ["ffmpeg", "python3", "ca-certificates", "curl"]
 
 [phases.build]
 cmds = [
-  "echo '[build] Downloading yt-dlp binary...'",
-  "curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp",
+  "echo '[build] Downloading yt-dlp nightly binary (best bot-bypass patches)...'",
+  "curl -fsSL https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o ./yt-dlp",
   "chmod a+rx ./yt-dlp",
   "echo '[build] yt-dlp version:' && ./yt-dlp --version",
   "echo '[build] Binary location:' && ls -lah ./yt-dlp"

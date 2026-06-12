@@ -36,7 +36,19 @@ function getYtDlpBin() {
 
 console.log('[startup] cwd =', process.cwd());
 console.log('[startup] __dirname =', __dirname);
-getYtDlpBin();
+const _foundBin = getYtDlpBin();
+
+// Self-update yt-dlp at startup — old versions get blocked by YouTube faster
+if (_foundBin !== 'yt-dlp') {
+  const { execFile } = require('child_process');
+  execFile(_foundBin, ['--update-to', 'stable'], (err, stdout, stderr) => {
+    if (err) {
+      console.warn('[startup] yt-dlp self-update failed (non-fatal):', stderr?.slice(0, 200));
+    } else {
+      console.log('[startup] yt-dlp update result:', stdout?.trim()?.slice(0, 100));
+    }
+  });
+}
 
 // ── Rate limiting ──────────────────────────────────────────────────────────
 const rateLimitMap = new Map();
@@ -85,9 +97,19 @@ function getPoTokenArgs() {
   const args = [];
   if (fs.existsSync(PO_TOKEN_PATH)) {
     try {
-      const token = fs.readFileSync(PO_TOKEN_PATH, 'utf8').trim();
-      if (token) {
-        args.push('--extractor-args', `youtube:po_token=web+${token}`);
+      const raw = fs.readFileSync(PO_TOKEN_PATH, 'utf8').trim();
+      if (raw) {
+        // Format: visitorData+poToken separated by newline, or just poToken
+        const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length >= 2) {
+          // File has visitorData on line 1, poToken on line 2
+          const visitorData = lines[0];
+          const poToken = lines[1];
+          args.push('--extractor-args', `youtube:visitor_data=${visitorData},po_token=web+${poToken}`);
+        } else {
+          // Just a raw poToken
+          args.push('--extractor-args', `youtube:po_token=web+${lines[0]}`);
+        }
         console.log('[bot] Using PO token');
       }
     } catch (_) {}
@@ -96,35 +118,55 @@ function getPoTokenArgs() {
 }
 
 // ── Advanced strategy matrix for bypassing bot detection ──────────────────
-// Each strategy is tried in order. Different combos hit different YouTube endpoints.
-// tv_embedded and mediaconnect are less monitored server-side clients.
+// Ordered by effectiveness on datacenter/shared IPs (2025).
+// tv_embedded + web_embedded bypass the toughest bot checks.
+// oauth2 uses a token flow that doesn't depend on IP reputation.
+// mediaconnect and web_safari are less monitored endpoints.
 const STRATEGIES = [
   {
+    // Best for datacenter IPs — embedded clients skip bot checks
     name: 'tv_embedded',
     extractorArgs: 'youtube:player_client=tv_embedded',
     extraArgs: ['--no-check-certificates'],
   },
   {
-    name: 'ios+cookies',
+    // web_embedded_player: another embedded client, often unblocked
+    name: 'web_embedded',
+    extractorArgs: 'youtube:player_client=web_embedded_player',
+    extraArgs: ['--no-check-certificates'],
+  },
+  {
+    // ios: Apple devices get lighter scrutiny
+    name: 'ios',
     extractorArgs: 'youtube:player_client=ios',
     extraArgs: ['--no-check-certificates', '--sleep-requests', '1'],
   },
   {
+    // android_vr: rarely blocked, Daydream endpoint
     name: 'android_vr',
     extractorArgs: 'youtube:player_client=android_vr',
     extraArgs: ['--no-check-certificates'],
   },
   {
+    // android_testsuite: internal test client, often overlooked by bot detection
+    name: 'android_testsuite',
+    extractorArgs: 'youtube:player_client=android_testsuite',
+    extraArgs: ['--no-check-certificates'],
+  },
+  {
+    // web_creator: YouTube Studio API endpoint
     name: 'web_creator',
     extractorArgs: 'youtube:player_client=web_creator',
     extraArgs: ['--no-check-certificates', '--sleep-requests', '1'],
   },
   {
+    // android fallback
     name: 'android',
     extractorArgs: 'youtube:player_client=android',
     extraArgs: ['--no-check-certificates', '--sleep-requests', '2'],
   },
   {
+    // mweb: mobile web, last resort
     name: 'mweb',
     extractorArgs: 'youtube:player_client=mweb',
     extraArgs: ['--no-check-certificates'],
@@ -141,13 +183,27 @@ const USER_AGENTS = [
 
 function getBaseArgs(strategy) {
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
+  // Build extractor-args: merge strategy client + po_token into ONE --extractor-args value
+  // to avoid yt-dlp ignoring a second --extractor-args flag
+  let extractorVal = strategy.extractorArgs.replace('youtube:', ''); // e.g. "player_client=tv_embedded"
+  const poTokenArgs = getPoTokenArgs();
+  let mergedExtractorArgs;
+  if (poTokenArgs.length > 0) {
+    // poTokenArgs is ['--extractor-args', 'youtube:visitor_data=...'] — extract just the value
+    const poVal = poTokenArgs[1].replace('youtube:', ''); // e.g. "po_token=web+TOKEN"
+    mergedExtractorArgs = `youtube:${extractorVal},${poVal}`;
+  } else {
+    mergedExtractorArgs = `youtube:${extractorVal}`;
+  }
+
   return [
-    '--extractor-args', strategy.extractorArgs,
+    '--extractor-args', mergedExtractorArgs,
     '--user-agent', ua,
     '--no-warnings',
     ...strategy.extraArgs,
     ...getCookieArgs(),
-    ...getPoTokenArgs(),
+    // poTokenArgs already merged above — don't push again
   ];
 }
 
