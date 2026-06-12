@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YT Downloader</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <div class="wrapper">
+
+    <div class="header">
+      <div class="logo">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+        </div>
+        <h1>YT Downloader</h1>
+      </div>
+      <p class="subtitle">Paste a YouTube link and download as MP3 or MP4</p>
+    </div>
+
+    <!-- Input Card -->
+    <div class="card">
+      <div class="input-row">
+        <input class="url-input" id="urlInput" placeholder="https://youtube.com/watch?v=..." />
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-mp4" onclick="addDownload('mp4')">&#11015; Download MP4</button>
+        <button class="btn btn-mp3" onclick="addDownload('mp3')">&#9836; Download MP3</button>
+      </div>
+    </div>
+
+    <!-- Queue Card -->
+    <div class="card" id="queueCard" style="display:none">
+      <div class="queue-header">
+        <div class="queue-title">Download queue</div>
+        <button class="btn-clear" onclick="clearDone()">Clear done</button>
+      </div>
+      <div id="queue"></div>
+    </div>
+
+  </div>
+
+  <script>
+    // ── Progress colour ───────────────────────────────────────────────────
+    function progressColor(pct) {
+      const stops = [
+        { p: 0, r: 255, g: 63, b: 63 },
+        { p: 25, r: 255, g: 140, b: 0 },
+        { p: 50, r: 245, g: 196, b: 0 },
+        { p: 75, r: 62, g: 207, b: 142 },
+        { p: 100, r: 62, g: 207, b: 142 },
+      ];
+      for (let i = 0; i < stops.length - 1; i++) {
+        const a = stops[i], b = stops[i + 1];
+        if (pct >= a.p && pct <= b.p) {
+          const t = (pct - a.p) / (b.p - a.p);
+          const lerp = (x, y) => Math.round(x + (y - x) * t);
+          return `rgb(${lerp(a.r, b.r)},${lerp(a.g, b.g)},${lerp(a.b, b.b)})`;
+        }
+      }
+      return 'rgb(62,207,142)';
+    }
+
+    let downloads = [];
+    const eventSources = {}; // id → EventSource
+
+    function cancelDownload(id) {
+      const es = eventSources[id];
+      if (es) { es.close(); delete eventSources[id]; }
+
+      const d = downloads.find(x => x.id === id);
+      if (d) {
+        d.status = 'cancelled';
+        d.stage = 'Cancelled.';
+        updateItem(id);
+      }
+    }
+
+    function addDownload(format) {
+      const inputUrl = document.getElementById('urlInput').value.trim();
+      if (!inputUrl) { document.getElementById('urlInput').focus(); return; }
+
+      const id = Date.now() + Math.random();
+
+      downloads.push({
+        id, url: inputUrl, format,
+        status: 'fetching', progress: 0,
+        title: 'Fetching title...', stage: 'Looking up video...', speed: '', eta: ''
+      });
+      document.getElementById('urlInput').value = '';
+      renderQueue();
+
+      const evtUrl = `/start?url=${encodeURIComponent(inputUrl)}&format=${format}&id=${id}`;
+      const es = new EventSource(evtUrl);
+      eventSources[id] = es;
+
+      es.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+
+        const d = downloads.find(x => x.id === id);
+        if (!d || d.status === 'cancelled') { es.close(); delete eventSources[id]; return; }
+
+        if (msg.type === 'title') {
+          d.title = msg.title;
+          d.status = 'fetching';
+          d.stage = 'Title found! Starting download...';
+          updateItem(id);
+          return;
+        }
+
+        if (msg.type === 'title_error') {
+          d.status = 'error';
+          d.title = 'Title fetch failed';
+          d.stage = msg.message || 'Could not fetch video info.';
+          updateItem(id);
+          es.close(); delete eventSources[id];
+          return;
+        }
+
+        if (msg.type === 'status') {
+          d.stage = msg.stage;
+          updateItem(id);
+          return;
+        }
+
+        if (msg.type === 'progress') {
+          d.status = 'downloading';
+          d.progress = msg.percent;
+          d.stage = msg.stage || '';
+          updateItem(id);
+          return;
+        }
+
+        if (msg.type === 'meta') {
+          if (msg.speed) d.speed = msg.speed;
+          if (msg.eta) d.eta = msg.eta;
+          updateItem(id);
+          return;
+        }
+
+        if (msg.type === 'file') {
+          d.status = 'done';
+          d.progress = 100;
+          d.stage = 'Complete!';
+          d.speed = '';
+          d.eta = '';
+          updateItem(id);
+          es.close(); delete eventSources[id];
+
+          const byteChars = atob(msg.base64);
+          const byteArr = new Uint8Array(byteChars.length);
+          for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+          const blob = new Blob([byteArr], { type: msg.mimeType });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = msg.filename;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+          return;
+        }
+
+        if (msg.type === 'error') {
+          d.status = 'error';
+          d.stage = msg.message || 'Download failed.';
+          updateItem(id);
+          es.close(); delete eventSources[id];
+          return;
+        }
+      };
+
+      es.onerror = () => {
+        const d = downloads.find(x => x.id === id);
+        if (d && d.status !== 'done' && d.status !== 'cancelled') {
+          d.status = 'error';
+          d.stage = 'Connection lost.';
+          updateItem(id);
+        }
+        es.close(); delete eventSources[id];
+      };
+    }
+
+    // ── Queue helpers ─────────────────────────────────────────────────────
+    function clearDone() {
+      downloads = downloads.filter(d => d.status !== 'done' && d.status !== 'error' && d.status !== 'cancelled');
+      renderQueue();
+    }
+
+    function renderQueue() {
+      const q = document.getElementById('queue');
+      const card = document.getElementById('queueCard');
+      if (downloads.length === 0) { card.style.display = 'none'; return; }
+      card.style.display = 'block';
+      q.innerHTML = downloads.map(d => itemHTML(d)).join('');
+    }
+
+    function itemHTML(d) {
+      const short = d.title
+        ? (d.title.length > 44 ? d.title.slice(0, 44) + '...' : d.title)
+        : (d.url.length > 44 ? d.url.slice(0, 44) + '...' : d.url);
+
+      const badgeClass = d.format === 'mp4' ? 'badge-mp4' : 'badge-mp3';
+      const color = progressColor(d.progress);
+      const isFetching = d.status === 'fetching';
+      const isActive = d.status === 'fetching' || d.status === 'downloading';
+
+      let statusLabel, statusClass;
+      if (d.status === 'fetching') { statusLabel = 'Fetching...'; statusClass = 'status-wait'; }
+      else if (d.status === 'downloading') { statusLabel = d.progress + '%'; statusClass = 'status-loading'; }
+      else if (d.status === 'done') { statusLabel = 'Done'; statusClass = 'status-done'; }
+      else if (d.status === 'cancelled') { statusLabel = 'Cancelled'; statusClass = 'status-cancel'; }
+      else { statusLabel = 'Failed'; statusClass = 'status-err'; }
+
+      const itemClass =
+        d.status === 'done' ? 'is-done' :
+          d.status === 'error' ? 'is-error' :
+            d.status === 'cancelled' ? 'is-cancelled' :
+              d.status === 'downloading' ? 'is-loading' :
+                d.status === 'fetching' ? 'is-fetching' : '';
+
+      const metaText = d.speed
+        ? `${d.speed}${d.eta ? ' · ETA ' + d.eta : ''}`
+        : (d.stage || '');
+
+      const barStyle = `width:${d.progress}%; background:${color}; box-shadow:0 0 8px ${color}55`;
+
+      // Cancel button — only when active
+      const cancelBtn = isActive
+        ? `<button class="btn-cancel" onclick="cancelDownload(${d.id})" title="Cancel">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+           </button>`
+        : '';
+
+      // Spinner (fetching) OR progress bar (downloading)
+      const progressSection = isFetching
+        ? `<div class="fetch-row">
+             <div class="spinner"></div>
+             <span class="fetch-stage">${d.stage || 'Looking up video...'}</span>
+           </div>`
+        : `<div class="progress-wrap">
+             <div class="progress-bar">
+               <div class="progress-fill" id="fill-${d.id}" style="${barStyle}"></div>
+             </div>
+             <div class="progress-label">
+               <span class="progress-pct" id="pct-${d.id}" style="color:${color}">${d.progress}%</span>
+               <span class="progress-stage" id="stage-${d.id}">${metaText}</span>
+             </div>
+           </div>`;
+
+      return `<div class="dl-item ${itemClass}" id="item-${d.id}">
+        <div class="dl-top">
+          <span class="dl-badge ${badgeClass}">${d.format.toUpperCase()}</span>
+          <span class="dl-title" id="title-${d.id}" title="${d.url}">${short}</span>
+          <span class="dl-status ${statusClass}" id="status-${d.id}">${statusLabel}</span>
+          ${cancelBtn}
+        </div>
+        <div id="progress-section-${d.id}">${progressSection}</div>
+      </div>`;
+    }
+
+    function updateItem(id) {
+      const d = downloads.find(x => x.id === id);
+      if (!d) return;
+
+      const itemEl = document.getElementById('item-' + id);
+      if (!itemEl) { renderQueue(); return; }
+
+      const color = progressColor(d.progress);
+      const isFetching = d.status === 'fetching';
+      const isActive = d.status === 'fetching' || d.status === 'downloading';
+
+      // Item class
+      itemEl.className = 'dl-item ' + (
+        d.status === 'done' ? 'is-done' :
+          d.status === 'error' ? 'is-error' :
+            d.status === 'cancelled' ? 'is-cancelled' :
+              d.status === 'downloading' ? 'is-loading' :
+                d.status === 'fetching' ? 'is-fetching' : ''
+      );
+
+      // Title
+      const titleEl = document.getElementById('title-' + id);
+      if (titleEl) {
+        const short = d.title
+          ? (d.title.length > 44 ? d.title.slice(0, 44) + '...' : d.title)
+          : (d.url.length > 44 ? d.url.slice(0, 44) + '...' : d.url);
+        titleEl.textContent = short;
+      }
+
+      // Status label
+      let statusLabel, statusClass;
+      if (d.status === 'fetching') { statusLabel = 'Fetching...'; statusClass = 'status-wait'; }
+      else if (d.status === 'downloading') { statusLabel = d.progress + '%'; statusClass = 'status-loading'; }
+      else if (d.status === 'done') { statusLabel = 'Done'; statusClass = 'status-done'; }
+      else if (d.status === 'cancelled') { statusLabel = 'Cancelled'; statusClass = 'status-cancel'; }
+      else { statusLabel = 'Failed'; statusClass = 'status-err'; }
+
+      const statusEl = document.getElementById('status-' + id);
+      if (statusEl) {
+        statusEl.textContent = statusLabel;
+        statusEl.className = 'dl-status ' + statusClass;
+      }
+
+      // Cancel button — update visibility
+      const existingCancel = itemEl.querySelector('.btn-cancel');
+      if (isActive && !existingCancel) {
+        const btn = document.createElement('button');
+        btn.className = 'btn-cancel';
+        btn.title = 'Cancel';
+        btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+        btn.onclick = () => cancelDownload(id);
+        itemEl.querySelector('.dl-top').appendChild(btn);
+      } else if (!isActive && existingCancel) {
+        existingCancel.remove();
+      }
+
+      // Progress section — swap between spinner and bar
+      const section = document.getElementById('progress-section-' + id);
+      if (!section) return;
+
+      if (isFetching) {
+        // Show spinner
+        const stageText = d.stage || 'Looking up video...';
+        if (!section.querySelector('.fetch-row')) {
+          section.innerHTML = `<div class="fetch-row">
+            <div class="spinner"></div>
+            <span class="fetch-stage" id="fetch-stage-${id}">${stageText}</span>
+          </div>`;
+        } else {
+          const fs = document.getElementById('fetch-stage-' + id);
+          if (fs) fs.textContent = stageText;
+        }
+      } else {
+        // Show progress bar (switching from fetching → downloading)
+        if (!section.querySelector('.progress-wrap')) {
+          section.innerHTML = `<div class="progress-wrap">
+            <div class="progress-bar">
+              <div class="progress-fill" id="fill-${id}" style="width:${d.progress}%; background:${color}; box-shadow:0 0 8px ${color}55"></div>
+            </div>
+            <div class="progress-label">
+              <span class="progress-pct" id="pct-${id}" style="color:${color}">${d.progress}%</span>
+              <span class="progress-stage" id="stage-${id}">${d.stage || ''}</span>
+            </div>
+          </div>`;
+        } else {
+          // Update existing bar
+          const fill = document.getElementById('fill-' + id);
+          if (fill) fill.style.cssText = `width:${d.progress}%; background:${color}; box-shadow:0 0 8px ${color}55; height:100%; border-radius:99px; transition:width 0.35s ease, background-color 0.4s ease`;
+
+          const pctEl = document.getElementById('pct-' + id);
+          if (pctEl) { pctEl.textContent = d.progress + '%'; pctEl.style.color = color; }
+
+          const stageEl = document.getElementById('stage-' + id);
+          if (stageEl) stageEl.textContent = d.speed
+            ? `${d.speed}${d.eta ? ' · ETA ' + d.eta : ''}`
+            : (d.stage || '');
+        }
+      }
+    }
+  </script>
+</body>
+
+</html>
