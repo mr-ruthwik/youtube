@@ -1,2 +1,6 @@
 [phases.setup]
-aptPkgs = ["ffmpeg", "yt-dlp"]
+aptPkgs = ["ffmpeg"]
+
+[phases.build]
+# This forces the latest version of yt-dlp to be installed
+cmds = ["pip install --upgrade yt-dlp"]

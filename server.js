@@ -40,21 +40,22 @@ function safeFilename(title) {
 
 // ── Helper: detect platform binary path ───────────────────────────────────
 function getBin(name) {
-    return name;
+  return name;
 }
 
 // ── Helper: fetch title using yt-dlp ──────────────────────────────────────
 function fetchTitle(url, signal) {
   return new Promise((resolve) => {
+    // 1. Ensure getBin('yt-dlp') returns just 'yt-dlp'
     const proc = spawn(getBin('yt-dlp'), ['--get-title', '--no-playlist', url]);
     let title = '';
+    let errorOutput = ''; // Added to store errors
 
     const timer = setTimeout(() => {
       proc.kill();
       resolve(null);
     }, 20000);
 
-    // Support cancel via AbortSignal
     if (signal) {
       signal.addEventListener('abort', () => {
         clearTimeout(timer);
@@ -64,16 +65,27 @@ function fetchTitle(url, signal) {
     }
 
     proc.stdout.on('data', d => (title += d.toString()));
-    proc.stderr.on('data', () => { });
+
+    // 2. Capture stderr instead of ignoring it
+    proc.stderr.on('data', (d) => {
+      errorOutput += d.toString();
+    });
 
     proc.on('close', code => {
       clearTimeout(timer);
-      const t = title.trim();
-      resolve(code === 0 && t ? t : null);
+      if (code !== 0) {
+        // 3. Log the error to the Render dashboard so we can see it
+        console.error('yt-dlp failed:', errorOutput);
+        resolve(null);
+      } else {
+        const t = title.trim();
+        resolve(t ? t : null);
+      }
     });
 
-    proc.on('error', () => {
+    proc.on('error', (err) => {
       clearTimeout(timer);
+      console.error('Process error:', err);
       resolve(null);
     });
   });
