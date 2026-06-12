@@ -40,9 +40,7 @@ function safeFilename(title) {
 
 // ── Helper: detect platform binary path ───────────────────────────────────
 function getBin(name) {
-  return process.platform === 'win32'
-    ? path.join(__dirname, `${name}.exe`)
-    : name;
+    return name;
 }
 
 // ── Helper: fetch title using yt-dlp ──────────────────────────────────────
