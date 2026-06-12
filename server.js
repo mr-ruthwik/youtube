@@ -39,7 +39,14 @@ function safeFilename(title) {
 }
 
 // ── Helper: detect platform binary path ───────────────────────────────────
+// On Render, yt-dlp is downloaded into the app directory during build
+// (./yt-dlp) because /usr/local/bin is not preserved across build→runtime.
+// We prefer the local binary when it exists; fall back to PATH for local dev.
 function getBin(name) {
+  if (name === 'yt-dlp') {
+    const localPath = path.join(__dirname, 'yt-dlp');
+    if (fs.existsSync(localPath)) return localPath;
+  }
   return name;
 }
 

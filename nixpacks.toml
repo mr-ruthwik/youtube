@@ -3,7 +3,7 @@ aptPkgs = ["ffmpeg", "python3", "ca-certificates", "curl"]
 
 [phases.build]
 cmds = [
-  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp",
-  "chmod a+rx /usr/local/bin/yt-dlp",
-  "yt-dlp --version"
+  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ./yt-dlp",
+  "chmod a+rx ./yt-dlp",
+  "./yt-dlp --version"
 ]
